@@ -1,0 +1,198 @@
+---
+title: "DE analysis"
+subtitle: "DESeq2, shrunken log fold change, P-values, ODID"
+author: "Mathias Cardner, Philipp Koch"
+date: "11.11.2020"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE)
+```
+
+## Load packages and data
+
+```{r}
+library(tidyverse)
+library(readxl)
+library(DESeq2)
+```
+
+```{r}
+countData <- read_excel("../Final/TableS1.xlsx",
+                        sheet = "RAW") %>%
+  column_to_rownames("ID") %>%
+  as.matrix()
+```
+
+## Pre-process
+
+DESeq2 uses the first level of `timepoint` as the baseline for DE tests. Since we want to compare against $t_0$, we relevel this to be the first level of `timepoint`. (This is also necessary for using `lfcShrink` later.) We leave $t_3$ as the last level, since this is the condition of interest.
+
+```{r}
+timepoint <- parse_number(colnames(countData)) %>% factor() %>% relevel("0")
+batch <- sub(".*\\d", "", colnames(countData))
+colData <- data.frame(row.names = colnames(countData),
+                      timepoint = timepoint,
+                      batch = factor(batch))
+```
+
+DESeq2 uses the last term of the design formula for contrasts, which in our case should be `timepoint`.
+
+```{r}
+dds <- DESeqDataSetFromMatrix(countData, colData, ~ batch + timepoint)
+dds <- dds[rowSums(counts(dds)) > 1,]
+#saveRDS(rownames(dds), "computations/IDs_used_in_DESeq.rds")
+```
+
+## Differential expression (abundance) analysis
+
+<!-- ## LRT of *batch* vs *batch + timepoint* -->
+
+<!-- We perform a likelihood ratio test of the GLM with only batch, vs the GLM with batch + timepoint. Genes for which this ratio is small favour the latter hypothesis, i.e. that the given gene is differentially expressed during the timecourse. Note that this is unlike the pairwise Wald tests, which compares two conditions. The resulting $p$-values will refer to the *LRT*, and \emph{only the fold change will vary with the contrast}. -->
+
+```{r eval=FALSE, include=FALSE}
+fdr <- 0.05
+# Perform LRT of reduced = ~ batch vs full = ~ batch + timepoint
+dds.LRT <- DESeq(dds, test = "LRT", reduced = ~ batch, parallel = TRUE)
+res.LRT <- results(dds.LRT, name = "timepoint_3_vs_0",
+                   alpha = fdr, parallel = TRUE)
+tcDEgenes <- rownames(res.LRT)[which(res.LRT$padj < fdr)]
+
+pc.top <- plotCounts(dds.LRT, order(res.LRT$padj)[1],
+                     intgroup = c("timepoint", "batch"), returnData = TRUE)
+
+ggplot(pc.top,
+       aes(x = parse_number(as.character(timepoint)), y = count, color = batch)) + 
+  geom_point() + geom_smooth(se = FALSE, method = "loess") +
+  scale_y_log10() +
+  theme_linedraw()
+```
+
+Fit DESeq model. Data from all time points and replicates are used to estimate dispersion, but only the contrast $t_3$ vs $t_0$ will be computed and tested in the end.
+
+```{r}
+dds.Wald <- DESeq(dds, parallel = TRUE)
+#saveRDS(dds.Wald, "computations/dds_Wald.rds")
+```
+
+<!-- Plot a PCA of the data normalised using the regularised logarithmic transform `rlog()`. -->
+
+```{r eval=FALSE, include=FALSE}
+rld <- rlog(dds)
+plotPCA(rld, intgroup = "timepoint") +
+  theme_bw() +
+  labs(title = "Principal component analysis of NGS count data",
+       subtitle = "Counts normalised using the regularised log transform")
+```
+
+Since we are only interested in peptides which may be toxic, i.e. those whose log fold change at $t_3$ and $t_1$ vs $t_0$ is negative, we set `altHypothesis = "less"`.
+
+```{r}
+res.Wald <- results(dds.Wald, name = "timepoint_3_vs_0", altHypothesis = "less",
+                    alpha = 0.05, parallel = TRUE)
+res.Wald$pvalue.t1 <- results(dds.Wald, name = "timepoint_1_vs_0", altHypothesis = "less",
+                    alpha = 0.05, parallel = TRUE)$pvalue
+res.Wald$padj.t1 <- results(dds.Wald, name = "timepoint_1_vs_0", altHypothesis = "less",
+                    alpha = 0.05, parallel = TRUE)$padj
+
+#saveRDS(res.Wald, "computations/res_Wald.rds")
+```
+
+## Shrink log fold changes (LFCs) vs time point 0
+
+Use `apeglm` to compute shrunken log2FoldChanges at time point `X` vs 0, and store the result in `lfcShrunkX`.
+
+```{r}
+lfcShrunk1 <- lfcShrink(dds.Wald, coef = "timepoint_1_vs_0", type = "apeglm",
+                        parallel = TRUE)
+lfcShrunk2 <- lfcShrink(dds.Wald, coef = "timepoint_2_vs_0", type = "apeglm",
+                        parallel = TRUE)
+lfcShrunk3 <- lfcShrink(dds.Wald, coef = "timepoint_3_vs_0", type = "apeglm",
+                        parallel = TRUE)
+```
+
+Add shrunken LFCs to DESeq2 result. First, copy `res.Wald` into `res.merged`. Then for each time point `X`, add `lfcShrinkX` containing the shrunken LFCs at time `X` vs $t_0$, as well as `lfcShrinkXSE` containing the corresponding "standard error" (actually posterior standard deviation).
+
+```{r}
+res.merged <- res.Wald
+res.merged$lfcShrink1 <- lfcShrunk1$log2FoldChange
+res.merged$lfcShrink1SE <- lfcShrunk1$lfcSE
+
+res.merged$lfcShrink2 <- lfcShrunk2$log2FoldChange
+res.merged$lfcShrink2SE <- lfcShrunk2$lfcSE
+
+res.merged$lfcShrink3 <- lfcShrunk3$log2FoldChange
+res.merged$lfcShrink3SE <- lfcShrunk3$lfcSE
+
+#calculation of CV
+test = DESeq2_database %>% 
+  mutate(CV1 = lfcShrink1SE/abs(lfcShrink1), CV2 = lfcShrink2SE/abs(lfcShrink2),CV3 = lfcShrink3SE/abs(lfcShrink3), CV = (CV1+CV2+CV3)/3) 
+```
+
+## Optical density
+
+Compute mean optical densities, $\bar{\operatorname{OD}}(t)$, across time points. Divide each mean OD by that at $t_0$, and take log2.
+
+```{r}
+log2meanODratios <- tibble(t0A = 0.1995,
+                           t0B = 0.2,
+                           t0C = 0.1995,
+                           t2A = 2.25,
+                           t2B = 2.19,
+                           t2C = 2.135,
+                           t1A = 0.705,
+                           t1B = 0.704,
+                           t1C = 0.697,
+                           t3A = 4.085,
+                           t3B = 4.305,
+                           t3C = 3.83) %>%
+  gather(condition, OD) %>%
+  # Group ODs by time point, and compute the mean.
+  mutate(timepoint = parse_number(condition)) %>%
+  group_by(timepoint) %>%
+  summarise(meanOD = mean(OD)) %>%
+  ungroup() 
+```
+
+Compute the the optical density of each peptide-expressing strain in Mex
+\[\operatorname{OD_{Mex}}(t)= 2^{\operatorname{lfcShrink(t)}} * \operatorname{\bar{OD}_{600}(t)}\]
+
+```{r}
+# Function for computing the relative number of cells (see formula above).
+ODID <- function(x) {
+  OD <- log2meanODratios %>%
+    filter(timepoint == x) %>%
+    pull(meanOD)
+  return(2^res.merged[[paste0("lfcShrink", x)]]*OD)
+}
+
+ODID_0 = 0.2
+
+res.merged$ODID_t0 <- ODID_0
+res.merged$ODID_t1 <- ODID(1)
+res.merged$ODID_t2 <- ODID(2)
+res.merged$ODID_t3 <- ODID(3)
+```
+
+
+Convert the data containing DESeq2 result of $t_3$ vs $t_0$, p-values, shrunken LFCs (vs $t_0$) and their SEs, as well as the number of cells at each time point relative to $t_0$. frame into a tibble and add information from the dictionary, such as DNA and AA sequence.
+
+```{r}
+dictionary <- read.csv("../Excel lists/ID_DNA_AA.csv")
+DESeq2_database <- res.merged %>%
+  as.data.frame() %>%
+  rownames_to_column("ID") %>%
+  as_tibble() %>%
+  left_join(dictionary %>%
+              mutate(ID = as.character(ID))) %>%
+  filter(!is.na(padj)) %>%
+  distinct(AAsequence, .keep_all = T)
+#saveRDS(database, "../Final/DESeq2_database_1120.rds")
+```
+
+## Session info
+
+```{r}
+sessionInfo()
+```
