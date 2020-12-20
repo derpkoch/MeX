@@ -1,6 +1,6 @@
 ---
-title: "DE analysis of MeX"
-subtitle: "DESeq2, shrunken log fold change, P-values, ODID"
+title: "Analysis of MeX NGS data"
+subtitle: "DESeq2, shrunken log fold change, p-values, ODID"
 author: "Mathias Cardner, Philipp Koch"
 date: "18.12.2020"
 output: pdf_document
